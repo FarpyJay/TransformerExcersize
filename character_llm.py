@@ -105,8 +105,10 @@ class NNCharLLM:
             if type(minibatch_size) is int and minibatch_size > 0:
                 assert minibatch_size < self.x_train.shape[0],\
                     ("minibatch size of %i has been chosen, but sample size is only %i" % (minibatch_size, self.xs.shape[0]))
-                xs_batch = self.x_train[torch.randint(0, self.x_train.shape[0], (minibatch_size,))]
-                ys_batch = self.y_train[torch.randint(0, self.y_train.shape[0], (minibatch_size,))]
+                # Note: I had a MAJOR bug hear. It's a shock that the model ever learned anything at all!
+                indices = torch.randint(0, self.x_train.shape[0], (minibatch_size,))
+                xs_batch = self.x_train[indices]
+                ys_batch = self.y_train[indices]
             else:
                 xs_batch, ys_batch = self.x_train, self.y_train
 
@@ -122,9 +124,9 @@ class NNCharLLM:
             loss.backward()
 
             # Note: I missed this in the first time through. Maybe this solves the loss issue???
-            lr_to_use = lr if epoch < 100000 else lr * 0.1
+            # lr_to_use = lr if epoch < 100000 else lr * 0.1
             for param in self.parameters:
-                param.data -= lr_to_use * param.grad
+                param.data -= lr * param.grad
 
         train_loss = F.cross_entropy(
             (torch.tanh(self.emb_vector[self.x_train].view(-1, 30) @ self.W1 + self.b1) @ self.W2 + self.b2), self.y_train)
@@ -190,5 +192,5 @@ if __name__ == '__main__':
 
     neural_network_name_generator = NNCharLLM(words)
     neural_network_name_generator.fit()
-    # neural_network_name_generator.fit(num_epochs=1, lr=0, minibatch_size=None)
+    neural_network_name_generator.fit(num_epochs=10000, lr=0.01)
     print(neural_network_name_generator(30))
