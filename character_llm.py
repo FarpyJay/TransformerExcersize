@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import random
 import torch
+from torch import nn
 from torch.nn import functional as F
 from homemade_layers import *
 
@@ -56,7 +57,7 @@ class SimpleCharLLM:
 
 # A name generation model whose next character generation is done from a trained shallow neural network
 class NNCharLLM:
-    def __init__(self, words, block_size=3, n_emb=10, n_hidden=100, split_data=True, seed=123):
+    def __init__(self, words, block_size=8, n_emb=10, n_hidden=68, split_data=True, seed=123):
         self.block_size = max(block_size, 1)
         self.n_emb = n_emb
         self.n_hidden = n_hidden
@@ -75,19 +76,19 @@ class NNCharLLM:
             self.x_val, self.y_val = self.x_train, self.y_train
             self.x_test, self.y_test = self.x_train, self.y_train
 
-        self.emb_vector = torch.randn((len(self.char2index),10), requires_grad=True)
-        self.layers = [
-            Linear(int(block_size*n_emb), n_hidden, bias=False),
-            BatchNorm1d(n_hidden),
-            Tanh(),
+        self.model = Sequential(
+            Embedding(len(self.char2index), self.n_emb),
+            FlattenConsecutive(2), Linear(int(2 * n_emb), n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+            FlattenConsecutive(2), Linear(int(2 * n_hidden), n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+            FlattenConsecutive(2), Linear(int(2 * n_hidden), n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
             Linear(n_hidden, len(self.char2index))
-            ]
+        )
 
-        for layer in self.layers:
+        for layer in self.model.layers:
             if isinstance(layer, Linear):
                 layer.weight *= 0.1
 
-        self.parameters = [self.emb_vector] + [param for layer in self.layers for param in layer.parameters()]
+        self.parameters = self.model.parameters()
 
         for param in self.parameters:
             param.requires_grad = True
@@ -127,11 +128,8 @@ class NNCharLLM:
                 xs_batch, ys_batch = self.x_train, self.y_train
 
             # Forward pass
-            embedding = self.emb_vector[xs_batch].view(-1, int(self.block_size * self.n_emb))
-            x = embedding
-            for layer in self.layers:
-                x = layer(x)
-            loss = F.cross_entropy(x, ys_batch)
+            logits = self.model(xs_batch)
+            loss = F.cross_entropy(logits, ys_batch)
 
             if epoch % 1000 == 0:
                 lossi.append(loss.item())
@@ -146,15 +144,11 @@ class NNCharLLM:
             for param in self.parameters:
                 param.data -= lr * param.grad
 
-        x = self.emb_vector[self.x_train].view(-1, self.block_size * self.n_emb)
-        for layer in self.layers:
-            x = layer(x)
-        train_loss = F.cross_entropy(x, self.y_train)
+        logits = self.model(self.x_train)
+        train_loss = F.cross_entropy(logits, self.y_train)
 
-        x = self.emb_vector[self.x_val].view(-1, self.block_size * self.n_emb)
-        for layer in self.layers:
-            x = layer(x)
-        val_loss = F.cross_entropy(x, self.y_val)
+        logits = self.model(self.x_val)
+        val_loss = F.cross_entropy(logits, self.y_val)
         print("Current train loss: %s\nCurrent val loss: %s" % (train_loss.item(), val_loss.item()))
 
         # plt.figure()
@@ -179,20 +173,16 @@ class NNCharLLM:
         plt.savefig('emb_scatter.png')
 
     def __call__(self, number_of_names):
-        for layer in self.layers:
-            if isinstance(layer, BatchNorm1d):
-                layer.training = False
+        for layer in self.model.layers:
+            layer.training = False
 
         name_list = list()
         for ii in range(number_of_names):
             context = [0] * self.block_size
             name = ''
             while True:
-                x = self.emb_vector[context].view(-1, int(self.block_size * self.n_emb))
-                for layer in self.layers:
-                    x = layer(x)
-
-                prob_vector = F.softmax(x)
+                logits = self.model(torch.tensor(context).view(1, -1))
+                prob_vector = F.softmax(logits)
                 generated_index = torch.multinomial(prob_vector, num_samples=1, replacement=True).item()
                 if generated_index == 0:
                     break
