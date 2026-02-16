@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import random
 import torch
 from torch.nn import functional as F
+from homemade_layers import *
 
 def get_words_from_file(filename='names.txt'):
     with open(filename, 'r') as namesfile:
@@ -55,8 +56,10 @@ class SimpleCharLLM:
 
 # A name generation model whose next character generation is done from a trained shallow neural network
 class NNCharLLM:
-    def __init__(self, words, block_size=3, split_data=True, seed=123):
+    def __init__(self, words, block_size=3, n_emb=10, n_hidden=100, split_data=True, seed=123):
         self.block_size = max(block_size, 1)
+        self.n_emb = n_emb
+        self.n_hidden = n_hidden
         self.char2index, self.index2char = get_letters_tables(words)
 
         random.seed(seed)
@@ -72,13 +75,23 @@ class NNCharLLM:
             self.x_val, self.y_val = self.x_train, self.y_train
             self.x_test, self.y_test = self.x_train, self.y_train
 
-        self.gen = torch.Generator().manual_seed(seed)
-        self.emb_vector = torch.randn((len(self.char2index),10), generator=self.gen, requires_grad=True)
-        self.W1 = torch.randn((30, 200), generator=self.gen, requires_grad=True)
-        self.b1 = torch.randn(200, generator=self.gen, requires_grad=True)
-        self.W2 = torch.randn((200, len(self.char2index)), generator=self.gen, requires_grad=True)
-        self.b2 = torch.randn(len(self.char2index), generator=self.gen, requires_grad=True)
-        self.parameters = [self.emb_vector, self.W1, self.b1, self.W2, self.b2]
+        self.emb_vector = torch.randn((len(self.char2index),10), requires_grad=True)
+        self.layers = [
+            Linear(int(block_size*n_emb), n_hidden, bias=False),
+            BatchNorm1d(n_hidden),
+            Tanh(),
+            Linear(n_hidden, len(self.char2index))
+            ]
+
+        for layer in self.layers:
+            if isinstance(layer, Linear):
+                layer.weight *= 0.1
+
+        self.parameters = [self.emb_vector] + [param for layer in self.layers for param in layer.parameters()]
+
+        for param in self.parameters:
+            param.requires_grad = True
+
 
     def _create_bigram_dataset(self, words):
         xs, ys = [], []
@@ -95,10 +108,11 @@ class NNCharLLM:
         return xs, ys
 
 
-    def fit(self, num_epochs=200000, lr=0.1, minibatch_size=32, regularization=0.005):
+    def fit(self, num_epochs=200000, lr=0.1, minibatch_size=32, regularization=0.005, custom_str=''):
 
         # lre = torch.linspace(-3, 0, num_epochs)
         # lrs = 10**(lre)
+        lossi = list()
 
         for epoch in range(num_epochs):
             # lr = lrs[epoch]
@@ -113,10 +127,14 @@ class NNCharLLM:
                 xs_batch, ys_batch = self.x_train, self.y_train
 
             # Forward pass
-            embedding = self.emb_vector[xs_batch]
-            h = torch.tanh(embedding.view(-1, 30) @ self.W1 + self.b1)
-            logits = h @ self.W2 + self.b2
-            loss = F.cross_entropy(logits, ys_batch)
+            embedding = self.emb_vector[xs_batch].view(-1, int(self.block_size * self.n_emb))
+            x = embedding
+            for layer in self.layers:
+                x = layer(x)
+            loss = F.cross_entropy(x, ys_batch)
+
+            if epoch % 1000 == 0:
+                lossi.append(loss.item())
 
             # Backward pass
             for param in self.parameters:
@@ -128,11 +146,20 @@ class NNCharLLM:
             for param in self.parameters:
                 param.data -= lr * param.grad
 
-        train_loss = F.cross_entropy(
-            (torch.tanh(self.emb_vector[self.x_train].view(-1, 30) @ self.W1 + self.b1) @ self.W2 + self.b2), self.y_train)
-        val_loss = F.cross_entropy(
-            (torch.tanh(self.emb_vector[self.x_val].view(-1, 30) @ self.W1 + self.b1) @ self.W2 + self.b2), self.y_val)
+        x = self.emb_vector[self.x_train].view(-1, self.block_size * self.n_emb)
+        for layer in self.layers:
+            x = layer(x)
+        train_loss = F.cross_entropy(x, self.y_train)
+
+        x = self.emb_vector[self.x_val].view(-1, self.block_size * self.n_emb)
+        for layer in self.layers:
+            x = layer(x)
+        val_loss = F.cross_entropy(x, self.y_val)
         print("Current train loss: %s\nCurrent val loss: %s" % (train_loss.item(), val_loss.item()))
+
+        # plt.figure()
+        # plt.plot(lossi)
+        # plt.savefig('loss_over_time_' + custom_str)
 
         return
 
@@ -152,18 +179,21 @@ class NNCharLLM:
         plt.savefig('emb_scatter.png')
 
     def __call__(self, number_of_names):
+        for layer in self.layers:
+            if isinstance(layer, BatchNorm1d):
+                layer.training = False
+
         name_list = list()
         for ii in range(number_of_names):
             context = [0] * self.block_size
             name = ''
             while True:
-                embedding = self.emb_vector[context]
-                h = torch.tanh(embedding.view(-1, 30) @ self.W1 + self.b1)
-                logits = h @ self.W2 + self.b2
-                counts = logits.exp()
-                prob_vector = counts / counts.sum(1, keepdim=True)
-                generated_index = \
-                    torch.multinomial(prob_vector, num_samples=1, replacement=True, generator=self.gen).item()
+                x = self.emb_vector[context].view(-1, int(self.block_size * self.n_emb))
+                for layer in self.layers:
+                    x = layer(x)
+
+                prob_vector = F.softmax(x)
+                generated_index = torch.multinomial(prob_vector, num_samples=1, replacement=True).item()
                 if generated_index == 0:
                     break
                 name += self.index2char[generated_index]
@@ -192,5 +222,5 @@ if __name__ == '__main__':
 
     neural_network_name_generator = NNCharLLM(words)
     neural_network_name_generator.fit()
-    neural_network_name_generator.fit(num_epochs=10000, lr=0.01)
+    neural_network_name_generator.fit(num_epochs=10000, lr=0.01, custom_str='fine_tuning')
     print(neural_network_name_generator(30))
