@@ -1,232 +1,257 @@
-
-import torch
+from dataclasses import dataclass
+import math
 from torch import nn
-from torch.nn import functional as F
+import tiktoken
 
-from helper_funcs import *
 from homemade_layers import *
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print('Device to use: %s' % device)
 
 
-class Head(nn.Module):
-    """ The meat and potatoes of attention. This thing is the opposite of ADHD"""
-    def __init__(self, block_size, head_size, n_emb, decode_attn=True, dropout=0.2):
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.head_size = head_size
-        self.key = nn.Linear(n_emb, head_size, bias=False)
-        self.query = nn.Linear(n_emb, head_size, bias=False)
-        self.value = nn.Linear(n_emb, head_size, bias=False)
-        if decode_attn:
-            self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-        self.decode_attn = decode
-        self.dropout = nn.Dropout(dropout)
+        assert config.n_emb % config.num_heads == 0
+        # key, query, value projections for all heads, but effectively concatenated
+        self.c_attn = nn.Linear(config.n_emb, 3*config.n_emb)
+        # output projection
+        self.c_proj = nn.Linear(config.n_emb, config.n_emb)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        # regularization
+        self.num_heads = config.num_heads
+        self.n_emb = config.n_emb
+        # not really a 'bias'. more of a mask, but following the OpenAI/HuggingFace naming though
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
 
-
-    # I have commented on each portion of this function with my best interpretation of how to think of each of these
-    # parts. Maybe I'll find that this is completely wrong, but I hope not. The last thing I want to do is piss off a
-    # bunch of people who're smarter than me...
+    # This implementation of the multihead is kind of crazy. It's computationally optimized, but it's very hard to
+    # follow the reshaping gymnastics that are going on.
     def forward(self, x):
-        B,T,C = x.shape
-        # Key: What words/ideas might be most important in the prompt?
-        k = self.key(x)  # (B,T,16)
-        # Query: What words/ideas might be most important for my answer?
-        q = self.query(x)  # (B,T,16)
-        # Value: What words/ideas are usually most important in general?
-        v = self.value(x) # (B,T,16); weighted aggregation of values
-        # Weights: Something like the correlation between the interpretation of the prompt
-        #          and the interpretation of possible answer words?
-        wei = q @ k.transpose(-2, -1) * self.head_size ** -0.5  # (B, T, T)
-        if self.decode_attn:
-            # Not allowed to see the future if the goal is specifically to try to predict the next word/idea
-            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-
-        wei = F.softmax(wei, dim=-1)  # Probability distribution of what might be the best answer words/ideas
-        wei = self.dropout(wei)
-        out = wei @ v  # I wonder if a biased self.value is where the distinct vocabulary/tone of AI comes from?
-
-        return out
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_emb)
+        # Calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
+        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
+        qkv = self.c_attn(x)
+        q,k,v = qkv.split(self.n_emb, dim=2)
+        k = k.view(B, T, self.num_heads, C //self.num_heads).transpose(1,2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.num_heads, C //self.num_heads).transpose(1,2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.num_heads, C //self.num_heads).transpose(1,2)  # (B, nh, T, hs)
 
 
-class MultiHead(nn.Module):
-    """Imagine the opposite of a kid with ADHD. Now imagine the opposite of a whole classroom of them."""
-    def __init__(self, num_heads, block_size, n_emb, dropout=0.2):
+        # attention (materializes the large (T,T) matrix for all the queries and keys)
+        att = (q @ k.transpose(-2, -1)) * (1/math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+
+
+        y = att @ v
+        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        y = y.transpose(1,2).contiguous().view(B, T, C) # reassemble all head outputs side by side
+        # output projection
+        y = self.c_proj(y)
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        head_size = n_emb // num_heads
-        self.heads = nn.ModuleList([Head(block_size, head_size, n_emb) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_emb, n_emb)
-        self.dropout = nn.Dropout(dropout)  # Note: See comment in def forward
-
-    def forward(self, x):
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
-        out = self.proj(out)
-
-        # Andrej Karpathy includes a dropout layer here, but I'm not convinced that this is stable, since the output of
-        # MultiHead is part of an input to a layer normalization. The problem is that when we calculate the xmean/xvar
-        # for a given normalization, our gradient computation for gamma and beta may be incorrect due to not including
-        # all of the weights to calculate xmean/xvar for the normalization. This is definitely an issue if we were to
-        # use BatchNorm and were calculating a running xmean/xvar. I can't find any definitive literature on this for
-        # LayerNorm. It may be that when you really work through the math, then this turns out to not be an issue at
-        # all. But I'm just a lowly hobbyist right now and am not getting paid to do this, so I feel no obligation at
-        # this time to go to all that trouble. I'd rather just go with what he found to work and maybe revisit later.
-        out = self.dropout(out)
-
-        return out
-
-
-class FeedForward(nn.Module):
-    """This feels weird to implement in this way, but ok..."""
-    def __init__(self, n_emb, dropout=0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_emb, 4 * n_emb),
-            nn.ReLU(),
-            nn.Linear(4 * n_emb, n_emb),
-            nn.Dropout(dropout)
-        )
+        self.c_fc = nn.Linear(config.n_emb, 4*config.n_emb)
+        self.gelu = nn.GELU(approximate='tanh')
+        self.c_proj = nn.Linear(4*config.n_emb, config.n_emb)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
-        return self.net(x)
-
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
 
 class Block(nn.Module):
     """Transformers: More than meets the eye. Transformers: Robots in disguise"""
-    def __init__(self, num_heads, block_size, n_emb):
+    def __init__(self, config):
         super().__init__()
-        assert num_heads > 0, "Number of heads must be a positive integer"
-        self.sas = MultiHead(num_heads, block_size, n_emb)
-        self.feed_forward = FeedForward(n_emb)
-        self.lnorm1 = nn.LayerNorm(n_emb)
-        self.lnorm2 = nn.LayerNorm(n_emb)
+        assert config.num_heads > 0, "Number of heads must be a positive integer"
+        self.ln_1 = nn.LayerNorm(config.n_emb)
+        self.attn = CausalSelfAttention(config)
+        # self.sas = MultiHead(config.num_heads, config.block_size, config.n_emb)
+        self.ln_2 = nn.LayerNorm(config.n_emb)
+        self.mlp = MLP(config)
+        # self.feed_forward = FeedForward(config.n_emb)
 
 
     def forward(self, x):
-        x = x + self.sas(self.lnorm1(x))
-        x = x + self.feed_forward(self.lnorm2(x))
+        x = x + self.attn(self.ln_1(x))
+        # x = x + self.sas(self.lnorm1(x))
+        x = x + self.mlp(self.ln_2(x))
+        # x = x + self.feed_forward(self.lnorm2(x))
         return x
 
 
-class DecodeTransformer(nn.Module):
-    """I know that these triple quotes at the beginning of classes can be used to automate documentation pages,
-    but I have absolutely no idea how to actually do that, and this repo is nowhere near important enough for me or
-    anyone else to care. Maybe I'll actually learn how to do that after I've finished my deep dive into the last five
-    years of AI :)
+@dataclass
+class GPTConfig:
+    block_size: int = 1024 # max sequence length
+    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    n_layer: int = 12 # number of layers
+    num_heads: int = 12 # number of heads
+    n_emb: int = 768 # embedding dimension
 
-    Also, I know that Andrej made vocab_size and n_emb global vars, but I want the user (me :P) to be able to pass
-    whatever might make sense in the future. We ain't in Jupyter anymore. (And I've been traumatized by how global
-    variables interact when you're trying to convert TF/PT code into a format that can be passed to some shitty custom
-    API written by hardware engineers who've made a cool cutting edge accelerator but have never heard the term, UX"""
-    def __init__(self, vocab_size, batch_size=64, block_size=256, n_emb=384, num_heads=6, n_layers=6):
+
+class GPT(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.batch_size = batch_size
-        self.block_size = block_size
-        self.token_emb_table = nn.Embedding(vocab_size, n_emb)
-        self.position_emb_table = nn.Embedding(block_size, n_emb)
-        # self.sa_heads = MultiHead(num_heads, block_size, n_emb//4, n_emb)  # self attention head
-        # self.feed_forward = FeedForward(n_emb)
-        self.blocks = nn.Sequential(*[Block(num_heads, block_size, n_emb) for _ in range(n_layers)])
-        self.ln_final = nn.LayerNorm(n_emb)
-        self.lm_head = nn.Linear(n_emb, vocab_size)  # language modeling head
+
+        # BFloat16 operations first became available starting with NVIDIA GTX 3000 series
+        # If our GPU is compatible, then we use BFloat16 for computational efficiency
+        gpu_model = torch.cuda.get_device_name(0)
+        self.USE_BF16 = True if 'NVIDIA' in gpu_model and int(gpu_model.split()[-1]) >= 3000 else False
+
+        self.config = config
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_emb),
+            wpe = nn.Embedding(config.block_size, config.n_emb),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_emb)
+        ))
+        self.lm_head = nn.Linear(config.n_emb, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=3e-4)
 
-        total_params = vocab_size * n_emb + block_size * n_emb
-        total_params += sum(p.numel() for p in self.blocks.parameters())
-        total_params += sum(p.numel() for p in self.ln_final.parameters())
-        total_params += sum(p.numel() for p in self.lm_head.parameters())
+        self.apply(self._init_weights)
 
-        print("Total number of parameters in model: %s" % total_params)
-
+    # What a goofy little thing we have here. Why are we using norm with std=0.02?? Why not just use xavier or he???
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2*self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        B, T = idx.shape
-        # idx and targets are both (B,T) tensor of integers
-        token_emb = self.token_emb_table(idx)                                  # (B,T,C)
-        position_emb = self.position_emb_table(torch.arange(T, device=device)) # (T,C)
-        x = token_emb + position_emb                                           # (B,T,C)
-
-        # x = self.sa_heads(x)                                                   # (B,T,C)
-        # x = self.feed_forward(x)                                               # (B,T,C)
-        x = self.blocks(x)
-        x = self.ln_final(x)
-        logits = self.lm_head(x)                                               # (B,T,vocab_size)
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # shape (T)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            # Crop idx to the last block_size tokens
-            idx_cond = idx[:, -self.block_size:]
-            # Get the prediction
-            logits, loss = self.forward(idx_cond)
-            # Focus only on the last time step
-            logits = logits[:, -1, :] # Becomes (B,C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B,C)
-            # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            # Append the sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        return idx
-
-    def get_batch(self, data):
-        ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
-        x = torch.stack([data[i:i+self.block_size] for i in ix])
-        y = torch.stack([data[i+1:i+self.block_size+1] for i in ix])
-        x, y = x.to(device), y.to(device)
-        return x, y
-
-    def fit(self, data, n_steps=5000):
+    def fit(self, data_loader, n_steps=50):
         for steps in range(n_steps):  # increase number of steps for good results...
             # sample a batch of data
-            xb, yb = self.get_batch(data)
+            xb, yb = data_loader.next_batch()
+            self.optimizer.zero_grad()
             # evaluate the loss
-            logits, loss = self.forward(xb, targets=yb)
-            self.optimizer.zero_grad(set_to_none=True)
+            if self.USE_BF16:
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = self.forward(xb, targets=yb)
+            else:
+                logits, loss = self.forward(xb, targets=yb)
             loss.backward()
             self.optimizer.step()
-            if steps % 500 == 0:
-                print("Current step: %s; Current loss: %s" % (steps, loss.item()))
+            print(f"Current step: {steps}; Current loss: {loss.item()}")
 
-if __name__=='__main__':
-    preload = False
-    train_model = True
-    default_path = "shakespeare_gpt.pt"
-    shakespeare_raw = get_words_from_file('input.txt')
 
-    chars = sorted(list(set(shakespeare_raw)))
-    char2index, index2char = get_letters_tables(chars)
-    encode = lambda s: [char2index[c] for c in s]
-    decode = lambda l: [index2char[i] for i in l]
+    @classmethod
+    def from_pretrained(self, model_type):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print("Loading weights from pretrained gpt: %s" % model_type)
 
-    all_data = torch.tensor(encode(shakespeare_raw), dtype=torch.long)
+        # n_layer, num_heads, and n_emb are determined from model_type
+        config_args = {
+            'gpt2': dict(n_layer=12, num_heads=12, n_emb=768),          # 124M params
+            'gpt2-medium': dict(n_layer=24, num_heads=16, n_emb=1024),  # 350M params
+            'gpt2-large': dict(n_layer=36, num_heads=20, n_emb=1280),   # 774M params
+            'gpt2-xl': dict(n_layer=48, num_heads=25, n_emb=1600),      # 1.5B params
+        }[model_type]
 
-    n = int(0.9*len(all_data))
-    train_data = all_data[:n]
-    val_data = all_data[n:]
+        config_args['vocab_size'] = 50257  # always this size for GPT2 model checkpoints
+        config_args['block_size'] = 1024   # always this size for GPT2 model checkpoints
+        # create a from-scratch initialized miniGPT model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        state_dict = model.state_dict()
+        sd_keys = state_dict.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask/buffer, as it's not a param
 
-    gpt_model = DecodeTransformer(len(chars))
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
 
-    if preload:
-        gpt_model.load_state_dict(torch.load(default_path, weights_only=True))
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # "basically, the openai checkpoints use a "Conv1D module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them" - Andrej Karpathy
+        # "Ok buddy, I'm going to pretend I understand why transposed will successfully do that." - Me
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
 
-    gptm = gpt_model.to(device)
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == state_dict[k].shape
+                with torch.no_grad():
+                    # Oh, I think I get it now. These particular modules are implemented with Conv1D?
+                    # What's still a little nebulous for me is I forget why Conv1D only needs to be transposed,
+                    # and why that's all that's necessary to conovert Conv1D to Linear
+                    # Update: ok, here's Google AI's explanation: https://share.google/aimode/bRumgX3s9ryba3nH0
+                    # Basically, OpenAI used Conv1D with kernal size of 1? Which is identical to Linear. But for
+                    # whatever reason, this was a better implementation in Tensorflow because hardware reasons i guess
+                    state_dict[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == state_dict[k].shape
+                with torch.no_grad():
+                    state_dict[k].copy_(sd_hf[k])
+        return model
 
-    if train_model:
-        gptm.fit(train_data)
-        torch.save(gptm.state_dict(), default_path)
 
-    gptm.eval()
+class DataLoaderLite:
+    def __init__(self, B, T, datafile='input.txt'):
+        self.B = B
+        self.T = T
 
-    # "Say the thing, B̶A̶R̶T̶ GPT"
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    print("".join(decode(gptm.generate(context, max_new_tokens=500)[0].tolist())))
+        # At init, load tokens from disk and store them in memory
+        with open(datafile, 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens).to(device)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B*T + 1]
+        x = buf[:-1].view(B,T)
+        y = buf[1:].view(B,T)
+        # Advance the position in the tensor
+        self.current_position += B*T
+        # If loading the next batch would be out of bounds, then reset
+        if self.current_position + (B*T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
