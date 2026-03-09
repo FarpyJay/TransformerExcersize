@@ -1,10 +1,39 @@
+
+# Base required libraries
+import os
 import time
 import torch
 from torch.nn import functional as F
+
+# Libraries required for distributed runs
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Local dependencies
 from gpt_2_recreation import GPT, GPTConfig, DataLoaderLite
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 if __name__ == "__main__":
+
+    ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a distributed data parallel run?
+    if ddp:
+        # Use of DDP atm demands CUDA; we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "CUDA is necessary for DDP (probably)"
+        init_process_group(backend='null')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0 # This process will do logging, checkpointing, etc.
+    else:
+        # Local, non-DDP run
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        # Attempt to autodetect device
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
     use_huggingface = True
     do_training = True
     num_return_sequences = 5
@@ -12,14 +41,22 @@ if __name__ == "__main__":
     import tiktoken
     enc = tiktoken.get_encoding('gpt2')
     # model = GPT.from_pretrained('gpt2')
-    model = GPT(GPTConfig())
+    model = GPT(GPTConfig(vocab_size=50304), device=device, master_process=master_process, ddp=ddp)
 
     model.to(device)
     model = torch.compile(model)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
 
     if do_training:
+        total_batch_size = 524288
         B, T = 4, 1024
-        data_loader = DataLoaderLite(B, T)
+        assert total_batch_size % (B*T) == 0, "total_batch_size must be divisible by B*T"
+        grad_accum_steps = total_batch_size // (B*T*ddp_world_size)
+        if master_process:
+            print(f"Total desired batch size: {total_batch_size}")
+            print(f"--> Calculated gradient accumulation steps: {grad_accum_steps}")
+        data_loader = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, device=device)
 
         # Note: This command sets operations to use Tensor Float 32 precision. However, these operations did not become
         #       available on NVIDIA GPUs until the release of the GTX 3000 series. Therefore, the below command will
@@ -27,10 +64,12 @@ if __name__ == "__main__":
         # torch.set_float32_matmul_precision('high')
 
         t0 = time.time()  # Get ballpark time estimate.
-        model.fit(data_loader)
+        model.fit(data_loader, accumulator_steps=grad_accum_steps)
         torch.cuda.synchronize()
         t1 = time.time()
-        print(f"we made it through a few steps of training. Yay! Training time: {(t1-t0) / 360} hours")
+
+    if ddp:
+        destroy_process_group()
 
     import sys; sys.exit(0)
     model.eval()

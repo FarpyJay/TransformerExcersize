@@ -4,9 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="7052f6e7-ee84-4700-a601-4c148995bf63" name="Changes" comment="Added the file that all the layers from scratch were cut/pasted to">
-      <change afterPath="$PROJECT_DIR$/gpt_2_huggingface.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/shakespeare_transformer.py" afterDir="false" />
+    <list default="true" id="7052f6e7-ee84-4700-a601-4c148995bf63" name="Changes" comment="Implemented GPT-2 (124M) from scratch">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/gpt_2_recreation.py" beforeDir="false" afterPath="$PROJECT_DIR$/gpt_2_recreation.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
@@ -52,20 +50,20 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;Python.ch_level_llm.executor&quot;: &quot;Run&quot;,
-    &quot;Python.character_llm.executor&quot;: &quot;Run&quot;,
-    &quot;Python.gpt_2_huggingface.executor&quot;: &quot;Run&quot;,
-    &quot;Python.gpt_2_recreation.executor&quot;: &quot;Run&quot;,
-    &quot;Python.main.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;gpt-2-full&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.ch_level_llm.executor": "Run",
+    "Python.character_llm.executor": "Run",
+    "Python.gpt_2_huggingface.executor": "Run",
+    "Python.gpt_2_recreation.executor": "Run",
+    "Python.main.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "gpt-2-full",
+    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable"
   }
-}</component>
+}]]></component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -137,7 +135,15 @@
       <option name="project" value="LOCAL" />
       <updated>1771950479052</updated>
     </task>
-    <option name="localTasksCounter" value="8" />
+    <task id="LOCAL-00008" summary="Implemented GPT-2 (124M) from scratch">
+      <option name="closed" value="true" />
+      <created>1772599035976</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1772599035976</updated>
+    </task>
+    <option name="localTasksCounter" value="9" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -159,7 +165,8 @@
     <MESSAGE value="Began implementation of mini GPT-2 model" />
     <MESSAGE value="Implemented base transformer model that can make pseudo-shakespeare when trained" />
     <MESSAGE value="Added the file that all the layers from scratch were cut/pasted to" />
-    <option name="LAST_COMMIT_MESSAGE" value="Added the file that all the layers from scratch were cut/pasted to" />
+    <MESSAGE value="Implemented GPT-2 (124M) from scratch" />
+    <option name="LAST_COMMIT_MESSAGE" value="Implemented GPT-2 (124M) from scratch" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>
@@ -176,13 +183,18 @@
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/main.py</url>
-          <line>56</line>
+          <line>83</line>
           <option name="timeStamp" value="11" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/gpt_2_recreation.py</url>
-          <line>141</line>
+          <line>184</line>
           <option name="timeStamp" value="12" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/gpt_2_recreation.py</url>
+          <line>175</line>
+          <option name="timeStamp" value="13" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>
