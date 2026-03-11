@@ -10,7 +10,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Local dependencies
-from gpt_2_recreation import GPT, GPTConfig, DataLoaderLite
+from gpt_2_recreation import GPT, GPTConfig
+from data_loader_lite import DataLoaderLite
 
 if __name__ == "__main__":
 
@@ -44,27 +45,32 @@ if __name__ == "__main__":
     model = GPT(GPTConfig(vocab_size=50304), device=device, master_process=master_process, ddp=ddp)
 
     model.to(device)
-    model = torch.compile(model)
+    # model = torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
 
     if do_training:
         total_batch_size = 524288
-        B, T = 4, 1024
+        B, T = 64, 1024
         assert total_batch_size % (B*T) == 0, "total_batch_size must be divisible by B*T"
         grad_accum_steps = total_batch_size // (B*T*ddp_world_size)
         if master_process:
             print(f"Total desired batch size: {total_batch_size}")
             print(f"--> Calculated gradient accumulation steps: {grad_accum_steps}")
-        data_loader = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, device=device)
+        train_loader = DataLoaderLite(
+            B, T,
+            process_rank=ddp_rank,
+            num_processes=ddp_world_size,
+            split='train',
+            master_process=master_process
+        )
 
         # Note: This command sets operations to use Tensor Float 32 precision. However, these operations did not become
         #       available on NVIDIA GPUs until the release of the GTX 3000 series. Therefore, the below command will
         #       have no effect if running on a CPU, an earlier NVIDIA GPU model, or an AMD RX Series GPU.
         # torch.set_float32_matmul_precision('high')
-
         t0 = time.time()  # Get ballpark time estimate.
-        model.fit(data_loader, accumulator_steps=grad_accum_steps)
+        model.fit(train_loader, accumulator_steps=grad_accum_steps)
         torch.cuda.synchronize()
         t1 = time.time()
 

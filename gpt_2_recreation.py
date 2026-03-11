@@ -1,19 +1,19 @@
 from dataclasses import dataclass
 import inspect
 import math
-from torch import nn
 import tiktoken
+from torch import nn
 
 import torch.distributed as dist
 
+from hellaswag import render_example, iterate_examples, get_most_likely_row
 from homemade_layers import *
 
 
-def get_lr(iteration):
-    max_lr = 1e-3
+def get_lr(iteration, max_lr=1e-3, warmup_steps=715, max_steps=19073):
+
     min_lr = max_lr*0.1
-    warmup_steps = 10
-    max_steps = 50
+
     # 1: Linear warmup for warmput_iters steps
     if iteration < warmup_steps:
         return max_lr * (iteration+1) / warmup_steps
@@ -202,13 +202,102 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-    def fit(self, data_loader, n_steps=50, accumulator_steps=1):
+    def fit(self, train_loader, val_loader, n_steps=50, accumulator_steps=1):
+        enc = tiktoken.get_encoding('gpt2')
         for step in range(n_steps):  # increase number of steps for good results...
+            last_step = (step == n_steps - 1)
+            if step % 250 == 0:
+                self.eval()
+                val_loader.reset()
+                with torch.no_grad():
+                    val_loss_accum = 0.0
+                    val_loss_steps = 20
+                    for _ in range(val_loss_steps):
+                        x, y = val_loader.next_batch()
+                        x, y = x.to(self.device), y.to(self.device)
+
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            logits, loss = self.forward(x, y)
+                            loss = loss / val_loss_steps
+                            val_loss_accum += loss.detach()
+
+                if self.ddp:
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)  # Accumulate mean accross all processes
+                if self.master_process:
+                    print(f"validation loss: {val_loss_accum.item():.4f}")
+
+                # if step % 250 == 0:
+                #     num_correct_norm = 0
+                #     num_total = 0
+                #     for i, example in enumerate(iterate_examples("val")):
+                #         # only process examples where i % ddp_world_size == ddp_rank
+                #         if i % ddp_world_size != self.ddp_rank:
+                #             continue
+                #         # render the example into tokens and labels
+                #         _, tokens, mask, label = render_example(example)
+                #         tokens = tokens.to(self.device)
+                #         mask = mask.to(self.device)
+                #         # get the logits
+                #         with torch.no_grad():
+                #             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                #                 logits, loss = self(tokens)
+                #             pred_norm = get_most_likely_row(tokens, mask, logits)
+                #         num_total += 1
+                #         num_correct_norm += int(pred_norm == label)
+                #     # reduce the stats across all processes
+                #     if self.ddp:
+                #         num_total = torch.tensor(num_total, dtype=torch.long, device=self.device)
+                #         num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=self.device)
+                #         dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                #         dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                #         num_total = num_total.item()
+                #         num_correct_norm = num_correct_norm.item()
+                #     acc_norm = num_correct_norm / num_total
+                #     if self.master_process:
+                #         print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+                #         with open('logfile.txt', "a") as f:
+                #             f.write(f"{step} hella {acc_norm:.4f}\n")
+
+                if step > 0:  # Also want to get some LLM output to see how the performance is doing
+                    self.eval()
+                    num_return_sequences = 4
+                    max_length = 32
+                    tokens = enc.encode("Hello, I'm a language_model,")
+                    tokens = torch.tensor(tokens, dtype=torch.long)
+                    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+                    xgen = tokens.to(self.device)
+                    sample_rng = torch.Generator(device=self.device)
+                    # sample_rng.manual_seed(42 + self.ddp_rank)
+                    while xgen.size(1) < max_length:
+                        # Forward the model to get the logits
+                        with torch.no_grad():
+                            logits, loss = self.forward(xgen)  # (B, T, vocab_size)
+                            # Take the logits at the last position
+                            logits = logits[:, -1, :]          # (B, vocab_size)
+                            # Get the probabilities
+                            probs = F.softmax(logits, dim=-1)
+                            # Do top-k sampling of 50 (huggingface pipeline default)
+                            # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                            # select a token from the top-k probabilities
+                            ix = torch.multinomial(topk_probs, 1)  # (8,1)
+                            # gather the corresponding indices
+                            xcol = torch.gather(topk_indices, -1, ix)  # (8,1)
+                            # append to the sequence
+                            xgen = torch.cat((x, xcol), dim=1)
+                        # Print the generated text
+                        for ii in range(num_return_sequences):
+                            tokens = xgen[ii, :max_length].tolist()
+                            decoded = enc.decode(tokens)
+                            # print(f"Rank {self.ddp_rank} Sample: {decoded}")
+                            print(f"Sample {ii}: {decoded}")
+
+
             self.optimizer.zero_grad()
             loss_accumulator = 0.0
             for acc_step in range(accumulator_steps):
                 # sample a batch of data
-                xb, yb = data_loader.next_batch()
+                xb, yb = train_loader.next_batch()
 
                 if self.ddp:  # If running a distributed parallel run, then use the synchronization flag
                     # WARNING: This is sketch, but it's less ugly than the official way PyTorch wants us to synchronize!
@@ -295,34 +384,3 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     state_dict[k].copy_(sd_hf[k])
         return model
-
-
-class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, device, datafile='input.txt'):
-        self.B = B
-        self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-
-        # At init, load tokens from disk and store them in memory
-        with open(datafile, 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens).to(device)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-
-        self.current_position = self.B * self.T * self.process_rank
-
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position + B*T + 1]
-        x = buf[:-1].view(B,T)
-        y = buf[1:].view(B,T)
-        # Advance the position in the tensor
-        self.current_position += B*T*self.num_processes
-        # If loading the next batch would be out of bounds, then reset
-        if self.current_position + (B*T*self.num_processes + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
-        return x, y
